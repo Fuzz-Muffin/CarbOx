@@ -1,5 +1,5 @@
 import numpy as np
-import functions
+#import functions
 import random
 import fil_io as io
 import argparse
