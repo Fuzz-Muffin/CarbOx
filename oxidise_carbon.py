@@ -229,6 +229,26 @@ def distance_fast(pos, box, pbc=[True, True, True]):
     # dist(i,j) == natom * i + j - ((i+2) * (i+1))//2
     return np.sqrt(dist_nd_sq)
 
+def distance_even_faster(pos, box, pbc=[True, True, True]):
+    n = pos.shape[0]  # Number of atoms
+    dist_nd_sq = np.zeros(n * (n - 1) // 2)  # Condensed distance matrix
+    k = 0
+    for i in range(n - 1):
+        # Pairwise differences for all remaining atoms
+        delta = pos[i + 1:] - pos[i]
+
+        # Apply PBC to the necessary dimensions
+        for dim in range(pos.shape[1]):
+            if pbc[dim]:
+                delta[:, dim] -= box[dim] * np.round(delta[:, dim] / box[dim])
+
+        # Compute squared distances
+        dist_nd_sq[k:k + n - i - 1] = np.sum(delta ** 2, axis=1)
+        k += n - i - 1
+
+    # Return actual distances by taking the square root
+    return np.sqrt(dist_nd_sq)
+
 def condmat2coord(nd_sq, natoms, cutoff=1.95):
     coord = np.zeros(natoms)
     mask = nd_sq < cutoff
@@ -358,13 +378,14 @@ if __name__=="__main__":
     #print(f'old distance routine: {t1-t0} s)')
 
     t0 = time.time()
-    dist_mat = distance_fast(apos, box)
+    #dist_mat = distance_fast(apos, box)
+    dist_mat = distance_even_faster(apos, box)
     acoords2 = condmat2coord(dist_mat,natoms)
     acoords = acoords2
     t1 = time.time()
     print(f'new distance routine: {t1-t0} s')
 
-    io.write_xyz_extra(natoms, atypelabels, apos, box, 'tmp.xzy', extra=[acoords, acoords2])
+    io.write_xyz(natoms, atypelabels, apos, box, 'tmp.xzy', extra=[acoords, acoords2])
 
     for coord in np.unique(acoords):
         mask = acoords == coord

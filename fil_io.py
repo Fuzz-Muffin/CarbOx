@@ -28,6 +28,8 @@ def write_xyz(natoms, atypes, apos, box, outfile, extra=None):
                     dim = arr[0].shape[0]
 
                 commentline += f':extra{i}:R:{dim}'
+    else:
+        extra = []
 
     commentline += '\n'
 
