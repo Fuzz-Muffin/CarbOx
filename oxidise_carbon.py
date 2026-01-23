@@ -5,6 +5,7 @@ import fil_io as io
 from ovito.io import *
 from ovito.modifiers import *
 from scipy.spatial.distance import pdist, squareform
+from pathlib import Path
 
 class progressbar:
   def __init__(self,minlen=10,symbol='-'):
@@ -47,7 +48,7 @@ class group:
                 self.surface = -1
 
         if group == 'hydroxyl':
-            self.labels = ['CFO1','CFH1']
+            self.labels = ['O1','H1']
             self.natoms = 2
             self.group = group
 
@@ -55,36 +56,88 @@ class group:
             self.aux_vec = aux_vec
 
         elif group == 'epoxy':
-            self.labels = ['CFO2',]
+            self.labels = ['O2',]
             self.natoms = 1
             self.group = group
             self.positions = np.array([[0.,0.,1.2],]) * self.surface + origin
             self.aux_vec = aux_vec
 
         elif group == 'H':
-            self.labels = ['CFH2',]
+            self.labels = ['H1']
             self.natoms = 1
             self.group = group
-            align_vec = (bonded_pos[1] - bonded_pos[0])*0.5 + bonded_pos[0]
-            align_vec = origin - align_vec
-            align_vec = 1.1 * align_vec / np.linalg.norm(align_vec)
-            self.positions = np.array([align_vec + origin, ])
-            self.aux_vec = aux_vec
+            surface_normal = np.array([0.0, 0.0, float(self.surface)])
+
+            #Bond direction)
+            bisector = np.zeros(3)
+            for bp in bonded_pos:
+                bisector -= (bp - origin)
+
+            if np.linalg.norm(bisector) < 1e-6:
+                bisector = surface_normal.copy()
+            else:
+                bisector /= np.linalg.norm(bisector)
+
+            #Distinction between armchair vs zigzag–like as in publication: https://www.sciencedirect.com/science/article/pii/S0927025616302063#:~:text=If%20a%20hydrogen%20atom%20is%20adsorbed%20to,atom%20is%20out%20of%20the%20graphene%20plane.
+            # Based on angle between bonded neighbors
+            alpha = 0.7  # default blend
+            if bonded_pos.shape[0] == 2:
+                b1 = bonded_pos[0] - origin
+                b2 = bonded_pos[1] - origin
+                b1 /= np.linalg.norm(b1)
+                b2 /= np.linalg.norm(b2)
+                angle = np.degrees(np.arccos(np.clip(np.dot(b1, b2), -1.0, 1.0)))
+                # Zigzag-like edges → more out-of-plane
+                if angle > 130.0:
+                    alpha = 0.6
+                # Armchair-like edges → more in-plane
+                else:
+                    alpha = 0.8
+
+            # Final H direction
+            direction = alpha * bisector + (1.0 - alpha) * surface_normal
+            direction /= np.linalg.norm(direction)
+
+            #Place hydrogen
+            self.positions = np.array([origin + 1.1 * direction])
+            self.aux_vec = direction
 
         elif group == 'H2':
-            self.labels = ['CFH3', 'CFH3']
+            self.labels = ['H2', 'H2']
             self.natoms = 2
             self.group = group
-            align_vec = (bonded_pos[1] - bonded_pos[0])*0.5 + bonded_pos[0]
-            align_vec = origin - align_vec
-            align_vec = 1.1 * align_vec / np.linalg.norm(align_vec)
-            p1 = rotate_about_vec(align_vec, bonded_pos[1] - bonded_pos[0], np.pi* 50./180.)
-            p2 = rotate_about_vec(align_vec, bonded_pos[1] - bonded_pos[0], -np.pi* 50./180.)
-            self.positions = np.array([p1, p2])
+
+            # Neighbours of this edge carbon
+            c1, c2 = bonded_pos[0], bonded_pos[1]
+
+            # Vector along edge bond
+            b = c2 - c1
+            b /= np.linalg.norm(b)
+
+            # Outward direction: from midpoint of neighbours to this carbon
+            mid = 0.5 * (c1 + c2)
+            z = origin - mid
+            z /= np.linalg.norm(z)
+            if np.sign(z[2]) != surface:
+                z *= -1
+
+            # Orthonormal basis
+            x = np.cross(z, b)
+            x /= np.linalg.norm(x)
+            y = np.cross(z, x)
+            y /= np.linalg.norm(y)
+
+            # Geometry
+            theta = np.deg2rad(50.0) #Maybe change this to a true tetrahedral structure 109deg?
+            v1 = 1.1 * (np.cos(theta) * z + np.sin(theta) * y)
+            v2 = 1.1 * (np.cos(theta) * z - np.sin(theta) * y)
+
+            # Absolute positions
+            self.positions = np.vstack((origin + v1, origin + v2))
             self.aux_vec = aux_vec
 
         elif group == 'carbonyl':
-            self.labels = ['CFO3',]
+            self.labels = ['O3',]
             self.natoms = 1
             self.group = group
             align_vec = (bonded_pos[1] - bonded_pos[0])*0.5 + bonded_pos[0]
@@ -94,7 +147,7 @@ class group:
             self.aux_vec = aux_vec
 
         elif group == 'COOH':
-            self.labels = ['CFO4', 'CFO5', 'CF9', 'CFH4']
+            self.labels = ['O4', 'O5', 'C9', 'H4']
             # O O C H coords
             els= np.array([[-2.6494655148,      0.8764317572,      0.1513536183],
                            [-0.8355786901,      1.0157882276,     -0.3418991825],
@@ -107,44 +160,37 @@ class group:
             self.positions = els
             self.aux_vec = aux_vec
 
-    def check_and_move(self, near_positions, box, r_cut, pbc=[True, True, False], count_limit= 10000):
+    def check_and_move(self, near_positions, box, r_cut, pbc=[True, True, False], count_limit=10000):
         is_good = False
-        flip_check = False
-        tmp = []
         counts = 0
-        # initial check to see if anything is too close
-        for p in self.positions:
-            dists = distance(p, near_positions, box, pbc)
-            #dists = np.zeros(near_positions.shape[0])
-            #functions.distances(p, near_positions, box, pbc, dists)
-            tmp.append(dists < r_cut)
-        num_close = np.array(tmp).flatten().sum()
-        if num_close > 0:
-            while counts < count_limit:
-                if self.group == 'epoxy':
-                    v = self.aux_vec
-                    v -= self.origin
-                else:
-                    v = np.array([random.random() for _ in range(3)])
-                for i,p in enumerate(self.positions):
-                    self.positions[i] = rotate_about_vec(p - self.origin, v, np.pi/15.) + self.origin
-                is_close = []
 
-                for p in self.positions:
-                    dists = distance(p, near_positions, box, pbc)
-                    #dists = np.zeros(near_positions.shape[0])
-                    #functions.distances(p, near_positions, box, pbc, dists)
-                    is_close.append(np.any(dists < r_cut))
+        while counts < count_limit:
+            num_close = 0
 
+            for p in self.positions:
+                # Wrap near_positions into primary image relative to THIS atom
+                delta = near_positions - p
+                for dim in range(3):
+                    if pbc[dim]:
+                        delta[:, dim] -= box[dim] * np.round(delta[:, dim] / box[dim])
+                dists = np.linalg.norm(delta, axis=1)
+                num_close += np.sum(dists < r_cut)
 
-                num_close = np.array(is_close).flatten().sum()
-                flip_check = self.check_flip_status()
-                counts += 1
-                if (num_close == 0) and (flip_check):
-                    is_good = True
-                    break
-        else:
-            is_good = True
+            if num_close == 0 and self.check_flip_status():
+                is_good = True
+                break
+
+            # Rotate and retry
+            if self.group == 'epoxy':
+                v = self.aux_vec - self.origin
+            else:
+                v = np.array([random.random() for _ in range(3)])
+
+            for i, p in enumerate(self.positions):
+                self.positions[i] = rotate_about_vec(p - self.origin, v, np.pi / 15.0) + self.origin
+
+            counts += 1
+
         return is_good
 
     def check_flip_status(self):
@@ -315,6 +361,8 @@ if __name__=="__main__":
                        help="Guess r_cut from particle labels. Default is False.")
     parser.add_argument('--surface_probe_radius', dest='surf_rad', default=4.0, type=float,
                        help="Specify the surface probe radius for surface mesh calculation. Default is 4.0 Å.")
+    parser.add_argument('--oxygen_ratio', dest='total_oxygen_ratio', default=0.5, type=float,
+                       help="Specify the ratio of oxygen atoms to carbon atoms in the final structure. Default is 0.5.")
 
     args = parser.parse_args()
 
@@ -332,6 +380,7 @@ if __name__=="__main__":
     outfile = args.outfile
     guess_rcut = args.guess_rcut
     surf_rad = args.surf_rad
+    oxy_ratio = args.total_oxygen_ratio
 
     if not silent:
         print(f'Coverage Factor: {cov_fact}')
@@ -357,7 +406,7 @@ if __name__=="__main__":
     is_surface = find_surface_atoms(infile, box, pbc, surf_rad)
     #box[-1] = apos[:,-1].max() - apos[:,-1].min() + 2.
 
-    io.write_xyz(natoms, atypelabels, apos, box, 'tmp.xzy')
+    io.write_xyz(natoms, atypelabels, apos, box, 'tmp.xyz')
 
     # determine coordination and give atoms a type label
     #p = progressbar(25)
@@ -382,19 +431,20 @@ if __name__=="__main__":
     dist_mat = distance_even_faster(apos, box)
     acoords2 = condmat2coord(dist_mat,natoms)
     acoords = acoords2
+    free_coords = 4 - acoords.copy()
     t1 = time.time()
     print(f'new distance routine: {t1-t0} s')
 
-    io.write_xyz(natoms, atypelabels, apos, box, 'tmp.xzy', extra=[acoords, acoords2])
+    io.write_xyz(natoms, atypelabels, apos, box, 'tmp.xyz', extra=[acoords, acoords2])
 
     for coord in np.unique(acoords):
         mask = acoords == coord
         if coord == 2:
-            atypelabels[mask] = 'CF2'
+            atypelabels[mask] = 'C2'
         elif coord == 3:
-            atypelabels[mask] = 'CF1'
+            atypelabels[mask] = 'C3'
         elif coord == 4:
-            atypelabels[mask] = 'CF4'
+            atypelabels[mask] = 'C4'
 
     unique_atypelabels = list(np.unique(atypelabels))
 
@@ -431,22 +481,22 @@ if __name__=="__main__":
     # first saturate the all the edges
     # point edges first
     num_point = (atypelabels == 'CF3').sum()
-    num_edge = (atypelabels == 'CF2').sum()
+    num_edge = (atypelabels == 'C2').sum()
     num_sites = num_point + num_edge
     mask = atypelabels == 'CF3'
     # convert point edges to ethers
-    atypelabels[mask] = 'CFO6'
+    atypelabels[mask] = 'O6'
     num_ether = num_point
-    mask = atypelabels == 'CFO6'
+    mask = atypelabels == 'O6'
     idx = np.where(mask)[0]
     for i,(c_id, c_pos, c_idx) in enumerate(zip(aids[mask], apos[mask], idx)):
         dists = distance(c_pos, apos, box, pbc= pbc)
         bonded_mask = np.logical_and(dists < r_cut, dists > 0.01)
         for b_id in aids[bonded_mask]:
-            atypelabels[aids == b_id] = 'CF10'
+            atypelabels[aids == b_id] = 'C10'
 
     # now edges
-    mask = atypelabels == 'CF2'
+    mask = atypelabels == 'C2'
     idx = np.where(mask)[0]
     for i,(c_id, c_pos, c_label, c_idx) in enumerate(zip(aids[mask], apos[mask], atypelabels[mask], idx)):
         percentage = float(i)/float(num_edge)
@@ -455,7 +505,7 @@ if __name__=="__main__":
             n = len(added_groups)
             all_pos = np.concatenate((apos, np.vstack([g.positions for g in added_groups])))
         else:
-            all_pos = apos
+            all_pos = apos.copy()
 
         # find neighbour carbons bonded to target carbon
         dists = distance(c_pos, apos, box, pbc= pbc)
@@ -470,64 +520,96 @@ if __name__=="__main__":
             pdb.set_trace()
 
         # find ALL atoms withn 12A of the target carbon
-        dists = distance(c_pos, all_pos, box, pbc=pbc)
-        #dists = np.zeros(all_pos.shape[0])
-        #functions.distances(c_pos, all_pos, box, pbc, dists)
-        all_dist_mask = (dists < 12.) & (dists > 0.01)
-        near_pos = all_pos[all_dist_mask].copy()
-        near_pos[:,pbc] -= box[pbc]*np.round(near_pos[:,pbc]/box[pbc])
+        anchor_mask = np.ones(len(all_pos), dtype=bool)
+        anchor_mask[c_idx] = False  # c_idx is the index of the anchor carbon in apos
+
+        near_pos = all_pos[anchor_mask].copy()
+        # Wrap into primary image relative to anchor carbon
+        for dim in range(3):
+            if pbc[dim]:
+                near_pos[:, dim] -= box[dim] * np.round((near_pos[:, dim] - c_pos[dim]) / box[dim])
 
         # roll the dice to decide which group is to be installed
         rand = random.random()
-        # carboxylic acid
-        if rand < 0.6:
-            g = group('COOH', c_pos, bonded_pos, box)
-            status = g.check_and_move(near_pos, box, sep, count_limit= count_limit)
-            if status == True:
-                added_groups.append(g)
-                atypelabels[c_idx] = 'CF7'
+
+        if rand < oxy_ratio:
+            # Pick randomly between COOH and carbonyl
+            if random.random() < 0.6:
+                g = group('COOH', c_pos, bonded_pos, box)
+                label = 'C7'
+                fallback_label = 'C2'
+                denied_counter = denied_carboxyl
             else:
-                denied_carboxyl += 1
+                g = group('carbonyl', c_pos, bonded_pos, box)
+                label = 'C8'
+                fallback_label = 'C2'
+                denied_counter = denied_carbonyl
+
+            status = g.check_and_move(near_pos, box, sep, count_limit=count_limit)
+            if status:
+                added_groups.append(g)
+                free_coords[c_idx] -= g.natoms
+                atypelabels[c_idx] = label
+            else:
+                denied_counter += 1
                 status = False
-                # force fit a hydrogen if nothing fits
-                while not status:
-                    g = group('H', c_pos, bonded_pos, box)
-                    # see if manually reducing sep to 1.2 helps
-                    status = g.check_and_move(near_pos, box, 1.2, count_limit= count_limit)
-                    if status == True:
-                        added_groups.append(g)
-                        atypelabels[c_idx] = 'CF2'
-                        break
+                #Force fit a single Hydrogen if nothing fits
+                if free_coords[c_idx] >= 1:
+                    while not status:
+                        g = group('H', c_pos, bonded_pos, box)
+                        status = g.check_and_move(near_pos, box, 1.2, count_limit=count_limit)
+                        if status:
+                            added_groups.append(g)
+                            atypelabels[c_idx] = fallback_label
+                            free_coords[c_idx] -= g.natoms
+                            break
 
         else:
-            g = group('carbonyl', c_pos, bonded_pos, box)
-            status = g.check_and_move(near_pos, box, sep, count_limit= count_limit)
-            if status == True:
-                added_groups.append(g)
-                atypelabels[c_idx] = 'CF8'
-            else:
-                # force fit a hydrogen if nothing fits
-                denied_carbonyl += 1
+            # Add hydrogen only (non-oxygen case)
+            if oxy_ratio == 0:
                 status = False
-                while not status:
-                    g = group('H', c_pos, bonded_pos, box)
-                    # see if manually reducing sep to 1.2 helps
-                    status = g.check_and_move(near_pos, box, 1.2, count_limit= count_limit)
-                    if status == True:
+                try_H2_first = (free_coords[c_idx] >= 2) and (random.random() < 0.01)
+                for attempt in range(2):
+                    if try_H2_first and attempt == 0:
+                        # try adding H2 first
+                        g = group('H2', c_pos, bonded_pos, box)
+                        label = 'C2'
+                    else:
+                        if free_coords[c_idx] < 1:
+                            break
+                        g = group('H', c_pos, bonded_pos, box)
+                        label = 'C2'
+                    status = g.check_and_move(near_pos, box, 1.2, count_limit=count_limit)
+                    if status:
                         added_groups.append(g)
-                        atypelabels[c_idx] = 'CF2'
+                        free_coords[c_idx] -= g.natoms
+                        atypelabels[c_idx] = label
                         break
+                    if free_coords[c_idx] >= 2:
+                        try_H2_first = not try_H2_first  # flip for next attempt
+            else:
+                # Fallback: single H only (never H2 when oxygen is globally enabled)
+                g = group('H', c_pos, bonded_pos, box)
+                status = g.check_and_move(near_pos, box, 1.2, count_limit=count_limit)
+                if status:
+                    added_groups.append(g)
+                    free_coords[c_idx] -= g.natoms
+                    atypelabels[c_idx] = 'C2'
 
-        if i+1==num_sites: p.updatefinal('install edge groups (%d/%d)'%(num_edge,num_edge))
+
+        if i+1==num_sites: 
+            p.updatefinal('install edge groups (%d/%d)'%(num_edge,num_edge))
 
     if len(added_groups) > 0:
         tmp_pos = np.vstack((apos, np.vstack([g.positions for g in added_groups])))
         tmp_labels = np.concatenate((atypelabels, np.array([el for g in added_groups for el in g.labels], dtype=str)))
 
-    io.write_xyz(len(tmp_pos), tmp_labels, tmp_pos, box, infile.split('.')[0] + '_edge_only.xyz')
+    infile_path_edge_only = Path(infile)
+    out_path_edge_only = infile_path_edge_only.with_name(infile_path_edge_only.stem + '_edge_only.xyz')
+    io.write_xyz(len(tmp_pos), tmp_labels, tmp_pos, box, out_path_edge_only)
 
     # select C1 surface atoms that are determined to be on the surface for functionalisation
-    surface_atype = 'CF1'
+    surface_atype = 'C3'
     surface_mask = (atypelabels == surface_atype) & (is_surface)
     chance = np.array([random.random() for _ in range(natoms)])
     mask = np.logical_and( surface_mask, chance <= cov_fact)
@@ -544,7 +626,7 @@ if __name__=="__main__":
             n = len(added_groups)
             all_pos = np.concatenate((apos, np.vstack([g.positions for g in added_groups])))
         else:
-            all_pos = apos
+            all_pos = apos.copy()
 
         # find thickness of substrate in local domain about the target
         dists = distance(c_pos[:-1], apos[:,:-1], box[:-1], pbc=[True, True])
@@ -576,12 +658,12 @@ if __name__=="__main__":
         # roll the dice to decide which group is to be installed
         rand = random.random()
         # hydroxyl
-        if (rand < oh2o_ratio) and (atypelabels[aids==c_id]=='CF1'):
+        if (rand < oh2o_ratio) and (atypelabels[aids==c_id]=='C3'):
             g = group('hydroxyl', c_pos, bonded_pos, box, surface= surface)
             status = g.check_and_move(near_pos, box, sep, count_limit= count_limit)
             if status == True:
                 added_groups.append(g)
-                atypelabels[c_idx] = 'CF5'
+                atypelabels[c_idx] = 'C5'
             else:
                 denied_hydroxyl += 1
 
@@ -596,9 +678,9 @@ if __name__=="__main__":
                 nextto_bonded = (dists < r_cut) & (dists > 0.01)
                 nextto_labels = atypelabels[nextto_bonded]
                 tmp = np.concatenate((nextto_labels,bonded_labels))
-                if ('CF6' not in tmp) and ('CF2' not in tmp):
+                if ('C6' not in tmp) and ('C2' not in tmp):
                     # check that there is nothing bonded to the other site carbon
-                    if (bonded_labels[b_idx] == 'CF1'):
+                    if (bonded_labels[b_idx] == 'C3'):
                         # get vector between the two carbon bonding sites
                         tmp = bonded_pos[b_idx] - c_pos
                         tmp[pbc] -= box[pbc]  * np.round(tmp[pbc]/box[pbc])
@@ -613,8 +695,8 @@ if __name__=="__main__":
                                                   count_limit= count_limit)
                         if status == True:
                             added_groups.append(g)
-                            atypelabels[bonded_ids[b_idx] == aids] = 'CF6'
-                            atypelabels[c_idx] = 'CF6'
+                            atypelabels[bonded_ids[b_idx] == aids] = 'C6'
+                            atypelabels[c_idx] = 'C6'
                             break
             if status == False:
                 denied_epoxy += 1

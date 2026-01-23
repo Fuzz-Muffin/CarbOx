@@ -56,12 +56,24 @@ def read_xyz(infile):
             natoms = int(fi.readline().strip())
             comment_line = fi.readline().strip()
             # check if it is in extended xyz format
-            if ('Properties' in comment_line) or ('Lattice' in comment_line):
+            if ('Properties=' in comment_line) or ('Lattice=' in comment_line):
                 is_extended_format = True
-                comment_line = comment_line.split('"')
-                header = comment_line[-1]
-                box = np.array([float(i) for i in comment_line[comment_line.index('Lattice=')+1].split()])
-                box = box.reshape(3,3).diagonal()
+
+                # Extract lattice using regex
+                lattice_match = re.search(r'Lattice="([^"]+)"', comment_line)
+                if lattice_match:
+                    lattice_str = lattice_match.group(1)
+                    box_vals = [float(val) for val in lattice_str.split()]
+                    box = np.array(box_vals).reshape(3,3).diagonal()
+                else:
+                    raise ValueError("Lattice information not found in extended XYZ comment line.")
+
+                # Extract Properties using regex
+                properties_match = re.search(r'Properties=([^\s]+)', comment_line)
+                if properties_match:
+                    header = properties_match.group(1)
+                else:
+                    header = ''
             else:
                 is_extended_format = False
                 id_ind = None
@@ -72,7 +84,10 @@ def read_xyz(infile):
             data = [next(fi) for n in range(natoms)]
 
         if is_extended_format:
-            props = header.split('Properties=')[1].split(':')
+            if header:
+                props = header.split(':')
+            else:
+                raise ValueError("Properties header is missing or malformed in extended XYZ file.")
             col_labels = [sss.lower() for sss in props[::3]]
             if 'id' not in col_labels:
                 id_ind = None
